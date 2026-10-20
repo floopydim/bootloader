@@ -13,6 +13,10 @@
 #include "partition.h"
 #include "fat32.h"
 #include "cfe.h"
+#include "rtc.h"
+#include "task.h"
+#include "acpi.h"
+#include "userproc.h"
 
 #define SHELL_PIT_HZ 100
 #define SHELL_HISTORY_MAX 16
@@ -330,6 +334,7 @@ static void shell_print_help(SHELL *sh) {
     console_printf(sh->con, "  panic             - trigger kernel panic\n");
     console_printf(sh->con, "  halt              - stop CPU\n");
     console_printf(sh->con, "  reboot            - reboot machine\n");
+    console_printf(sh->con, "  poweroff          - ACPI S5 shutdown (FADT + DSDT _S5)\n");
     console_printf(sh->con, "Memory:\n");
     console_printf(sh->con, "  mem               - show boot memory info\n");
     console_printf(sh->con, "  pmm               - show PMM info\n");
@@ -390,6 +395,13 @@ static void shell_print_help(SHELL *sh) {
     console_printf(sh->con, "  uptime            - show uptime based on PIT ticks\n");
     console_printf(sh->con, "  piton             - enable PIT IRQ0 timer\n");
     console_printf(sh->con, "  pitoff            - disable PIT IRQ0 timer\n");
+    console_printf(sh->con, "Processes & system:\n");
+    console_printf(sh->con, "  date              - wall clock from CMOS RTC\n");
+    console_printf(sh->con, "  ps                - list kernel-managed tasks\n");
+    console_printf(sh->con, "  cpuinfo           - CPU vendor/model via CPUID\n");
+    console_printf(sh->con, "User programs:\n");
+    console_printf(sh->con, "  run <file.elf>    - run an ELF64 binary in ring 3 "
+                             "(syscall via INT 0x80)\n");
     console_printf(sh->con, "Editor:\n");
     console_printf(sh->con, "  cfe <part> <file> [-kbp-vim] - CFOS text editor\n");
     console_printf(sh->con, "TCC Compiler:\n");
@@ -1615,9 +1627,9 @@ static void shell_resolve_path(const char *input, char *out, uint32_t out_size) 
     /* Relative path — combine with cwd */
     uint32_t i = 0;
     while (g_cwd[i] && i < out_size - 1) { out[i] = g_cwd[i]; i++; }
+    /* Root cwd "/" already ends with the separator; deeper dirs need one. */
+    if (i > 1 && out[i - 1] != '/' && i < out_size - 1) out[i++] = '/';
     uint32_t j = 0;
-    /* Remove trailing '/' from cwd if present (except root) */
-    if (i > 1 && out[i-1] == '/') i--;
     while (input[j] && i < out_size - 1) { out[i++] = input[j++]; }
     out[i] = '\0';
 }
@@ -1960,6 +1972,220 @@ static void shell_run_touch(SHELL *sh, const char *args) {
 }
 
 
+static void shell_run_date(SHELL *sh) {
+    RTC_TIME t;
+    static const char *months[12] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+
+    if (!rtc_get_time(&t)) {
+        console_printf(sh->con, "date: RTC not responding or clock invalid\n");
+        return;
+    }
+
+    if (t.month >= 1 && t.month <= 12) {
+        console_printf(sh->con, "%s %u %u, ", months[t.month - 1],
+                       (unsigned int)t.day, (unsigned int)t.year);
+    } else {
+        console_printf(sh->con, "%u-%u-%u, ",
+                       (unsigned int)t.year, (unsigned int)t.month,
+                       (unsigned int)t.day);
+    }
+
+    /* console_printf has no width specifiers — pad manually */
+    {
+        char hh[3], mm[3], ss[3];
+        hh[0] = (char)('0' + (t.hour / 10) % 10);   hh[1] = (char)('0' + t.hour % 10);   hh[2] = '\0';
+        mm[0] = (char)('0' + (t.minute / 10) % 10); mm[1] = (char)('0' + t.minute % 10); mm[2] = '\0';
+        ss[0] = (char)('0' + (t.second / 10) % 10); ss[1] = (char)('0' + t.second % 10); ss[2] = '\0';
+        console_printf(sh->con, "%s:%s:%s\n", hh, mm, ss);
+    }
+}
+
+static const char *shell_task_state_name(uint32_t state) {
+    switch (state) {
+        case TASK_STATE_READY:      return "READY";
+        case TASK_STATE_RUNNING:    return "RUNNING";
+        case TASK_STATE_BLOCKED:    return "BLOCKED";
+        case TASK_STATE_TERMINATED: return "DEAD";
+        default:                    return "?";
+    }
+}
+
+static void shell_run_ps(SHELL *sh) {
+    task_t *t;
+    uint32_t count;
+
+    t = task_get_list();
+    count = task_get_count();
+
+    console_printf(sh->con, "ps: %u task(s)\n", (unsigned int)count);
+    console_printf(sh->con, "  TID STATE    PRIO USED   MODE NAME\n");
+
+    while (t) {
+        console_printf(sh->con, "  %3u %-8s %4u %5u  %s %s\n",
+                       (unsigned int)t->tid,
+                       shell_task_state_name(t->state),
+                       (unsigned int)t->priority,
+                       (unsigned int)t->time_used,
+                       t->is_kernel_task ? "K" : "U",
+                       t->name);
+        t = t->next;
+    }
+}
+
+static void shell_run_cpuinfo(SHELL *sh) {
+    uint32_t a, b, c, d;
+    char vendor[13];
+    char brand[49];
+    uint32_t i;
+
+    __asm__ __volatile__("cpuid"
+                         : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                         : "a"(0));
+    vendor[0] = (char)(b & 0xFF);
+    vendor[1] = (char)((b >> 8) & 0xFF);
+    vendor[2] = (char)((b >> 16) & 0xFF);
+    vendor[3] = (char)((b >> 24) & 0xFF);
+    vendor[4] = (char)(d & 0xFF);
+    vendor[5] = (char)((d >> 8) & 0xFF);
+    vendor[6] = (char)((d >> 16) & 0xFF);
+    vendor[7] = (char)((d >> 24) & 0xFF);
+    vendor[8] = (char)(c & 0xFF);
+    vendor[9] = (char)((c >> 8) & 0xFF);
+    vendor[10] = (char)((c >> 16) & 0xFF);
+    vendor[11] = (char)((c >> 24) & 0xFF);
+    vendor[12] = '\0';
+
+    console_printf(sh->con, "cpuinfo:\n");
+    console_printf(sh->con, "  vendor:        %s\n", vendor);
+    console_printf(sh->con, "  cores (MADT):  %u\n", (unsigned int)acpi_get_cpu_count());
+
+    /* Brand string, if extended CPUID is supported */
+    __asm__ __volatile__("cpuid" : : "a"(0x80000000U));
+    __asm__ __volatile__("cpuid"
+                         : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                         : "a"(0x80000000U));
+    if (a >= 0x80000004U) {
+        for (i = 0; i < 3; i++) {
+            uint32_t leaf = 0x80000002U + i;
+            __asm__ __volatile__("cpuid"
+                                 : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                                 : "a"(leaf));
+            uint32_t j = i * 16;
+            brand[j + 0]  = (char)(a & 0xFF);
+            brand[j + 1]  = (char)((a >> 8) & 0xFF);
+            brand[j + 2]  = (char)((a >> 16) & 0xFF);
+            brand[j + 3]  = (char)((a >> 24) & 0xFF);
+            brand[j + 4]  = (char)(b & 0xFF);
+            brand[j + 5]  = (char)((b >> 8) & 0xFF);
+            brand[j + 6]  = (char)((b >> 16) & 0xFF);
+            brand[j + 7]  = (char)((b >> 24) & 0xFF);
+            brand[j + 8]  = (char)(c & 0xFF);
+            brand[j + 9]  = (char)((c >> 8) & 0xFF);
+            brand[j + 10] = (char)((c >> 16) & 0xFF);
+            brand[j + 11] = (char)((c >> 24) & 0xFF);
+            brand[j + 12] = (char)(d & 0xFF);
+            brand[j + 13] = (char)((d >> 8) & 0xFF);
+            brand[j + 14] = (char)((d >> 16) & 0xFF);
+            brand[j + 15] = (char)((d >> 24) & 0xFF);
+        }
+        brand[48] = '\0';
+
+        /* Trim leading spaces and print */
+        i = 0;
+        while (brand[i] == ' ' && brand[i]) {
+            i++;
+        }
+        console_printf(sh->con, "  brand:         %s\n", &brand[i]);
+    }
+
+    __asm__ __volatile__("cpuid"
+                         : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                         : "a"(1));
+    console_printf(sh->con, "  family/model:  fam %u mod %u (stepping %u)\n",
+                   (unsigned int)((a >> 8) & 0xF), (unsigned int)((a >> 4) & 0xF),
+                   (unsigned int)(a & 0xF));
+    console_printf(sh->con, "  NX bit:        %s\n",
+                   ((d & (1U << 20)) ? "yes" : "no"));
+}
+
+static void shell_run_poweroff(SHELL *sh) {
+    console_printf(sh->con, "Powering off via ACPI S5...\n");
+
+    if (acpi_poweroff() < 0) {
+        console_printf(sh->con, "poweroff: ACPI S5 not available "
+                                "(no FADT / invalid PM1a_CNT / no _S5)\n");
+        return;
+    }
+
+    /* acpi_poweroff() never returns on success (hlt loop after the
+     * SLP_EN write); if we ever land here, fall through to idle. */
+    console_printf(sh->con, "poweroff: SLP_EN write issued but CPU is still up.\n");
+    for (;;) {
+        __asm__ volatile ("hlt");
+    }
+}
+
+static void shell_run_user(SHELL *sh, const char *args) {
+    uint8_t *data = NULL;
+    uint32_t data_size = 0;
+    uint64_t exit_code = 0;
+    char name[SHELL_CWD_MAX];
+    char path[SHELL_CWD_MAX];
+    uint32_t k;
+    uint32_t name_len = 0;
+    int result;
+
+    if (!g_cwd_part) {
+        console_printf(sh->con, "run: no partition set (use cd <part>)\n");
+        return;
+    }
+
+    if (!args || !*args) {
+        console_printf(sh->con, "run: missing ELF path\n");
+        return;
+    }
+
+    if (args[0] == '/') {
+        k = 0;
+        while (args[k] && k < sizeof(path) - 1) { path[k] = args[k]; k++; }
+        path[k] = '\0';
+    } else {
+        shell_resolve_path(args, path, sizeof(path));
+    }
+
+    /* program display name = last path element */
+    for (k = 0; path[k]; k++) {
+        if (path[k] == '/') {
+            name_len = k + 1;
+        }
+    }
+    k = 0;
+    while (path[name_len + k] && k < sizeof(name) - 1) {
+        name[k] = path[name_len + k];
+        k++;
+    }
+    name[k] = '\0';
+
+    if (!fat32_read_file(g_cwd_part, path, &data, &data_size)) {
+        console_printf(sh->con, "run: cannot read '%s'\n", path);
+        return;
+    }
+
+    result = userproc_run(sh->con, name, data, data_size, &exit_code);
+
+    kfree(data);
+
+    if (result < 0) {
+        console_printf(sh->con, "run: failed (error %d), not started\n", result);
+        return;
+    }
+
+    console_printf(sh->con, "run: program \"%s\" finished\n", name);
+}
+
 static void shell_execute(SHELL *sh) {
     if (sh->length == 0) {
         return;
@@ -2208,6 +2434,35 @@ static void shell_execute(SHELL *sh) {
 
     if (str_eq(sh->input, "ticks")) {
         shell_print_ticks(sh);
+        return;
+    }
+
+    if (str_eq(sh->input, "date")) {
+        shell_run_date(sh);
+        shell_reset_input(sh);
+        return;
+    }
+
+    if (str_eq(sh->input, "ps")) {
+        shell_run_ps(sh);
+        shell_reset_input(sh);
+        return;
+    }
+
+    if (str_eq(sh->input, "cpuinfo")) {
+        shell_run_cpuinfo(sh);
+        shell_reset_input(sh);
+        return;
+    }
+
+    if (str_eq(sh->input, "poweroff")) {
+        shell_run_poweroff(sh);
+        return;
+    }
+
+    if (str_starts_with(sh->input, "run ")) {
+        shell_run_user(sh, sh->input + 4);
+        shell_reset_input(sh);
         return;
     }
 

@@ -99,4 +99,18 @@ void acpi_print_table(CONSOLE *con, acpi_sdt_header_t *header);
 uint32_t acpi_get_cpu_count(void);
 uint64_t acpi_get_local_apic_address(void);
 
+/*
+ * ACPI shutdown (S5) via FADT PM1a_CNT + DSDT _S5 parsing.
+ * Returns 0 if the S5 sleep request was issued (the machine should
+ * power off; execution normally never gets back here), -1 on failure
+ * (no FADT / insane register / no _S5 object).
+ */
+int acpi_poweroff(void);
+
+/*
+ * ACPI hardware reset (RESET_REG from FADT when revision >= 2).
+ * Returns 0 if the reset write was issued, -1 if unsupported.
+ */
+int acpi_reset(void);
+
 #endif

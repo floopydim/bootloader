@@ -20,6 +20,7 @@
 #include "sched.h"
 #include "syscall.h"
 #include "gdt.h"
+#include "serial.h"
 
 /* TCC in-kernel compiler */
 extern int tcc_kernel_init(CONSOLE *con);
@@ -497,6 +498,10 @@ void kernel_main(BOOT_INFO *boot_info) {
 
     crashlog_init(boot_info);
     crashlog_mark_booting();
+
+    /* Bring COM1 online before the console: the very first banner line
+     * is then visible on a serial terminal / QEMU -serial stdio. */
+    serial_init();
 
     console_init(&con, boot_info, 0x00FFFFFF, 0x00000000);
     panic_set_console(&con);

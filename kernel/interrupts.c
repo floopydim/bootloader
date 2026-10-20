@@ -4,6 +4,7 @@
 #include "pic.h"
 #include "pit.h"
 #include "exceptions.h"
+#include "userproc.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -108,6 +109,12 @@ void interrupts_init(void) {
      */
     pic_irq_unmask(2);
 
+    /*
+     * INT 0x80 — syscall-гейт для ring 3: должен быть вызываемым из
+     * CPL 3, поэтому DPL=3 (0xEE: P=1, DPL=3, interrupt gate).
+     */
+    idt_set_gate(0x80, (uint64_t)(uintptr_t)isr_stub_table[0x80], 0xEE);
+
     idt_load();
 }
 
@@ -123,6 +130,13 @@ void interrupt_dispatch(INTERRUPT_FRAME *frame) {
 
     if (vec < 32) {
         handle_exception(frame);
+        /* Will not return for ring 3: userproc_handle_fault() inside
+         * handle_exception restores the kernel context instead. */
+    }
+
+    if (vec == 0x80) {
+        userproc_handle_syscall(frame);
+        return;
     }
 
     if (vec >= 32 && vec < 48) {

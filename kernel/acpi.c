@@ -1,5 +1,6 @@
 #include "acpi.h"
-#include "console.h"
+#include "io.h"
+#include "panic.h"
 #include <stddef.h>
 
 static int acpi_initialized = 0;
@@ -276,4 +277,256 @@ uint64_t acpi_get_local_apic_address(void) {
     }
     
     return (uint64_t)madt->local_apic_address;
+}
+
+/*
+ * ==================== S5 shutdown and reset ====================
+ */
+
+/* FADT register fields we care about (ACPI 2.0+, byte offsets). */
+#define FADT_OFF_PM1A_CNT      64
+#define FADT_OFF_PM1B_CNT      68
+#define FADT_OFF_PM1_CNT_LEN   87
+#define FADT_OFF_REV2          0
+
+static uint32_t fadt_u32(acpi_sdt_header_t *fadt, uint32_t off) {
+    const uint8_t *p = (const uint8_t*)fadt;
+    uint32_t v;
+
+    if (fadt->length < off + 4) {
+        return 0;
+    }
+
+    v = (uint32_t)p[off] |
+        ((uint32_t)p[off + 1] << 8) |
+        ((uint32_t)p[off + 2] << 16) |
+        ((uint32_t)p[off + 3] << 24);
+    return v;
+}
+
+/*
+ * Parse the DSDT for "\_S5" and return SLP_TYPa (0..7).
+ *
+ * The object is declared as:
+ *     0x08 "_S5_" 0x12 <PkgLen> <NumElements> <Int0> ...
+ * This is the byte sequence used by every sane DSDT; instead of a full
+ * AML interpreter we scan for the literal bytes and decode the first
+ * integer element of the package. Values appear either as Zero/OneOp
+ * or BytePrefix.
+ */
+static int dsdt_find_s5_slp_typ(uint8_t *out_value) {
+    acpi_sdt_header_t *dsdt;
+    const uint8_t *p;
+    const uint8_t *end;
+    uint32_t len;
+    uint32_t i;
+    static const uint8_t s5_name_seq[5] = { 0x08, 0x5F, 0x53, 0x35, 0x5F }; /* NameOp "_S5_" */
+
+    /*
+     * DSDT is not an entry of RSDT/XSDT: it lives in memory and is
+     * referenced FROM the FADT (DSDT address at byte offset 40).
+     */
+    {
+        acpi_sdt_header_t *fadt = acpi_find_table(ACPI_SIG_FADT);
+        if (!fadt || fadt->length < 44) {
+            return 0;
+        }
+        {
+            uint32_t dsdt_phys = fadt_u32(fadt, 40);
+            if (dsdt_phys == 0) {
+                return 0;
+            }
+            dsdt = (acpi_sdt_header_t*)(uintptr_t)dsdt_phys;
+        }
+    }
+
+    /* Validate the DSDT header (signature + checksum) before scanning. */
+    if (acpi_memcmp(dsdt->signature, "DSDT", 4) != 0 ||
+        acpi_checksum(dsdt, dsdt->length) != 0 ||
+        dsdt->length < 64) {
+        return 0;
+    }
+
+    p    = (const uint8_t*)dsdt;
+    end  = p + dsdt->length;
+    len  = dsdt->length;
+
+    for (i = 0; i + 12 < len; i++) {
+        int k;
+        int match = 1;
+
+        for (k = 0; k < 5; k++) {
+            if (p[i + k] != s5_name_seq[k]) {
+                match = 0;
+                break;
+            }
+        }
+        if (!match) {
+            continue;
+        }
+
+        /* PackageOp expected right after the name */
+        if (p[i + 5] != 0x12) {
+            continue;
+        }
+
+        /* Decode PkgLength (one-byte form covers our small package). */
+        {
+            uint32_t j = i + 6;
+            uint8_t len_byte = p[j];
+            uint32_t pkg_len;
+
+            if ((len_byte & 0xC0) == 0xC0) {
+                /* 3-byte form: len_byte + 2 bytes (ignore high bits) */
+                pkg_len = (uint32_t)((len_byte & 0x0F) |
+                          ((uint32_t)p[j + 1] << 4) |
+                          ((uint32_t)p[j + 2] << 12));
+                if (pkg_len < 4 || j + 3 + pkg_len > (uint32_t)len) {
+                    continue;
+                }
+                j += 3;
+            } else if ((len_byte & 0xC0) == 0x40) {
+                /* 2-byte form */
+                pkg_len = (uint32_t)((len_byte & 0x0F) |
+                          ((uint32_t)p[j + 1] << 4));
+                if (pkg_len < 4 || j + 2 + pkg_len > (uint32_t)len) {
+                    continue;
+                }
+                j += 2;
+            } else {
+                pkg_len = len_byte;
+                if (pkg_len < 3 || j + 1 + pkg_len > (uint32_t)len) {
+                    continue;
+                }
+                j += 1;
+            }
+
+            if (j < end - 2) {
+                /* NumElements byte, then first package element */
+                uint8_t n_el = p[j];
+                uint8_t elem = p[j + 1];
+                (void)n_el;
+
+                if (elem == 0x00) {              /* ZeroOp  */
+                    *out_value = 0;
+                    return 1;
+                } else if (elem == 0x01) {       /* OneOp   */
+                    *out_value = 1;
+                    return 1;
+                } else if (elem == 0x0A) {       /* BytePrefix */
+                    if (j + 2 < (uint32_t)(end - p)) {
+                        *out_value = p[j + 2];
+                        return 1;
+                    }
+                } else if (elem == 0x0B) {       /* WordPrefix */
+                    if (j + 3 < (uint32_t)(end - p)) {
+                        *out_value = p[j + 2] & 0x07;
+                        return 1;
+                    }
+                } else if (elem == 0x0C) {       /* DWordPrefix */
+                    if (j + 5 < (uint32_t)(end - p)) {
+                        *out_value = p[j + 2] & 0x07;
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+int acpi_poweroff(void) {
+    acpi_sdt_header_t *fadt;
+    uint32_t pm1a_cnt;
+    uint8_t slp_typ;
+    uint16_t value;
+
+    if (!acpi_initialized) {
+        return -1;
+    }
+
+    fadt = acpi_find_table(ACPI_SIG_FADT);
+    if (!fadt) {
+        return -1;
+    }
+
+    pm1a_cnt = fadt_u32(fadt, FADT_OFF_PM1A_CNT);
+    if (pm1a_cnt == 0 || pm1a_cnt >= 0x10000U) {
+        return -1;
+    }
+
+    /* The PM1a_CNT register must be at least 2 bytes wide. */
+    {
+        uint8_t pm1_cnt_len = 0;
+        if (fadt->length > FADT_OFF_PM1_CNT_LEN) {
+            pm1_cnt_len = ((const uint8_t*)fadt)[FADT_OFF_PM1_CNT_LEN];
+        }
+        if (pm1_cnt_len > 0 && pm1_cnt_len < 2) {
+            return -1;
+        }
+    }
+
+    if (!dsdt_find_s5_slp_typ(&slp_typ)) {
+        return -1;
+    }
+
+    if (slp_typ > 7) {
+        slp_typ &= 0x07;
+    }
+
+    value = (uint16_t)((slp_typ << 10) | (1U << 13)); /* SLP_TYP | SLP_EN */
+    outw((uint16_t)pm1a_cnt, value);
+
+    /* Should never return; belt-and-braces idle loop. */
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
+}
+
+int acpi_reset(void) {
+    acpi_sdt_header_t *fadt;
+
+    if (!acpi_initialized) {
+        return -1;
+    }
+
+    fadt = acpi_find_table(ACPI_SIG_FADT);
+    if (!fadt || fadt->revision < 2) {
+        return -1;
+    }
+
+    /*
+     * FADT for ACPI >= 2: RESET_REG is a GAS (12 bytes) at offset 116:
+     *   [116] address_space_id (must be 1 = SystemMemory or 0 = SystemIO)
+     *   [117] bit_width, [118] bit_offset, [119] access_size
+     *   [120..127] 64-bit address
+     * RESET_TYPE (byte) at offset 128.
+     */
+    if (fadt->length < 129) {
+        return -1;
+    }
+    {
+        const uint8_t *p = (const uint8_t*)fadt;
+        uint8_t gas_space = p[116];
+        uint64_t gas_addr = (uint64_t)p[120] | ((uint64_t)p[121] << 8) |
+                            ((uint64_t)p[122] << 16) | ((uint64_t)p[123] << 24) |
+                            ((uint64_t)p[124] << 32) | ((uint64_t)p[125] << 40) |
+                            ((uint64_t)p[126] << 48) | ((uint64_t)p[127] << 56);
+        uint8_t reset_type = p[128];
+
+        if (gas_addr == 0 || reset_type == 0) {
+            return -1;
+        }
+
+        /* Only SystemIO (0) or SystemMemory (1) bridge practically. We
+         * implement the SystemIO case which is what real and virtual
+         * firmware both use. */
+        if (gas_space == 0 && gas_addr < 0x10000ULL) {
+            outb((uint16_t)gas_addr, reset_type);
+            return 0;
+        }
+    }
+
+    return -1;
 }

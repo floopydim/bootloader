@@ -1,5 +1,6 @@
 #include "console.h"
 #include "font.h"
+#include "serial.h"
 
 static void draw_char(CONSOLE *con, uint32_t px, uint32_t py, char c) {
     if ((unsigned char)c >= 128) {
@@ -124,6 +125,9 @@ void console_backspace(CONSOLE *con) {
 }
 
 void console_putchar(CONSOLE *con, char c) {
+    /* Mirror every visible character to COM1 (no-op if no UART). */
+    serial_mirror_char(c);
+
     if (c == '\n') {
         con->cursor_x = 0;
         con->cursor_y++;

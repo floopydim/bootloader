@@ -1,6 +1,7 @@
 #include "exceptions.h"
 #include "panic.h"
 #include "crashlog.h"
+#include "userproc.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -89,6 +90,21 @@ void exceptions_set_console(CONSOLE *con) {
 __attribute__((noreturn))
 void handle_exception(INTERRUPT_FRAME *frame) {
     uint64_t vec;
+
+    /*
+     * Fault from ring 3: the userspace task is the bug, not the
+     * kernel. Kill the task and restore the kernel context instead of
+     * panicking.
+     */
+    if (frame && (frame->cs & 3) == 3) {
+        userproc_handle_fault(frame);
+
+        /* Unreachable: userproc_handle_fault switches CR3/saved state
+         * and returns straight into the shell. */
+        for (;;) {
+            __asm__ volatile ("cli; hlt");
+        }
+    }
 
     panic_set_stage("cpu exception");
 

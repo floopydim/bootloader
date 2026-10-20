@@ -43,8 +43,7 @@ int task_is_initialized(void) {
 task_t* task_create(const char *name, uint64_t entry, int is_kernel, uint32_t priority) {
     task_t *task;
     uint64_t stack_phys;
-    uint64_t i;
-    
+
     if (!task_initialized) {
         return NULL;
     }
@@ -184,6 +183,29 @@ task_t* task_get_by_tid(uint32_t tid) {
     }
     
     return NULL;
+}
+
+task_t* task_get_list(void) {
+    if (!task_initialized) {
+        return NULL;
+    }
+    return task_list;
+}
+
+uint32_t task_get_count(void) {
+    task_t *t;
+    uint32_t count = 0;
+
+    if (!task_initialized) {
+        return 0;
+    }
+
+    t = task_list;
+    while (t) {
+        count++;
+        t = t->next;
+    }
+    return count;
 }
 
 void task_set_state(task_t *task, uint32_t state) {

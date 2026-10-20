@@ -906,10 +906,27 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     );
 
     if (status != EFI_SUCCESS) {
-        print(SystemTable, L"Failed to load selected ELF kernel. Status=");
-        print_hex(SystemTable, status);
-        print(SystemTable, L"\r\n");
-        halt_forever();
+        /* Some FAT implementations (e.g. EDK2 FatPkg) may fail to match the
+         * long name "COREFORGE" even though it is present; fall back to the
+         * DOS short name alias (COREFO~1). */
+        if (status == EFI_NOT_FOUND) {
+            print(SystemTable, L"Kernel path open failed, trying short-name alias\r\n");
+            status = load_kernel_elf_from_path(
+                ImageHandle,
+                SystemTable,
+                L"\\EFI\\COREFO~1\\KERNELS\\KERNEL.ELF",
+                plan.kernel_phys_base,
+                plan.kernel_reserved_size,
+                &elf_result
+            );
+        }
+
+        if (status != EFI_SUCCESS) {
+            print(SystemTable, L"Failed to load selected ELF kernel. Status=");
+            print_hex(SystemTable, status);
+            print(SystemTable, L"\r\n");
+            halt_forever();
+        }
     }
 
     print(SystemTable, L"Selected ELF kernel loaded successfully\r\n");

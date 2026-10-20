@@ -58,11 +58,16 @@ void task_set_current(task_t *task);
 
 task_t* task_get_by_tid(uint32_t tid);
 
+/* Snapshot for diagnostic tools (ps). */
+task_t* task_get_list(void);
+uint32_t task_get_count(void);
+
 void task_set_state(task_t *task, uint32_t state);
 uint32_t task_get_state(task_t *task);
 
 /* Context switching */
 void task_switch(task_t *from, task_t *to);
+extern void task_switch_asm(task_context_t *from, task_context_t *to);
 void task_yield(void);
 
 #endif

@@ -31,3 +31,7 @@ image/EFI/COREFORGE/KERNELS/*
 initramfs/
 initramfs*
 init
+
+# userspace binaries are generated
+image/USERS/*
+!image/USERS/.gitkeep

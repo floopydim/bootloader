@@ -1,7 +1,7 @@
 #include "gdt.h"
 #include <stdint.h>
 
-#define GDT_ENTRIES 6
+#define GDT_ENTRIES 8
 
 static gdt_entry_t gdt[GDT_ENTRIES];
 static tss_t tss;
@@ -75,8 +75,14 @@ void gdt_init(void) {
     tss_init();
     
     /* Setup GDT pointer */
-    gdt_ptr.limit = (sizeof(gdt_entry_t) * GDT_ENTRIES) + sizeof(tss_entry_t) - 1;
+    gdt_ptr.limit = (sizeof(gdt_entry_t) * GDT_ENTRIES) - 1;
     gdt_ptr.base = (uint64_t)&gdt[0];
+
+    /* Actually load it: the GDT/TSS registers must reflect this table
+     * before any ring 3 transition (IRET to a DPL3 selector GPFs if the
+     * active GDT is still the firmware one). */
+    gdt_flush((uint64_t)&gdt_ptr);
+    tss_flush(GDT_ENTRY_TSS * 8);
 }
 
 void gdt_load(void) {

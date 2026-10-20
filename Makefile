@@ -10,6 +10,22 @@ NASMFLAGS       := -f elf64
 EFI_LDFLAGS     := /subsystem:efi_application /entry:efi_main /nodefaultlib /out:image/EFI/BOOT/BOOTX64.EFI
 KERNEL_LDFLAGS  := -nostdlib -static -z max-page-size=0x1000 -T kernel/linker.ld -o image/EFI/COREFORGE/KERNELS/KERNEL.ELF
 
+USERSPACE_CFLAGS  := -target x86_64-unknown-none-elf -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone -mno-sse -fno-builtin -O1 -Wall -mcmodel=large
+USERSPACE_OBJS    := \
+		user/crt0.o \
+		user/hello.o
+
+USERSPACE_LDFLAGS := -nostdlib -static -z max-page-size=0x1000 -T user/user_linker.ld
+
+# Per-program link rules (each user program links crt0 + its own object)
+image/USERS/HELLO.ELF: user/crt0.o user/hello.o user/user_linker.ld | build
+		mkdir -p image/USERS
+		$(LD_KERNEL) $(USERSPACE_LDFLAGS) -o $@ user/crt0.o user/hello.o
+
+image/USERS/FAULT.ELF: user/crt0.o user/fault.o user/user_linker.ld | build
+		mkdir -p image/USERS
+		$(LD_KERNEL) $(USERSPACE_LDFLAGS) -o $@ user/crt0.o user/fault.o
+
 OVMF_CODE       := /usr/share/edk2/x64/OVMF_CODE.4m.fd
 OVMF_VARS_SRC   := /usr/share/edk2/x64/OVMF_VARS.4m.fd
 OVMF_VARS_DST   := build/OVMF_VARS.4m.fd
@@ -55,6 +71,10 @@ KERNEL_OBJS := \
 		kernel/sched.o \
 		kernel/syscall.o \
 		kernel/acpi.o \
+		kernel/serial.o \
+		kernel/rtc.o \
+		kernel/userproc.o \
+		kernel/user_enter.o \
 		kernel/tcc_wrap.o \
 		kernel/tcc_shell.o \
 		kernel/tcc/tcc.o \
@@ -62,16 +82,18 @@ KERNEL_OBJS := \
 		kernel/cfe.o \
 		kernel/cfe_config.o
 
-.PHONY: all build bootloader kernel run clean rebuild tap-up disk disk-rebuild disk-clean
+.PHONY: all build bootloader kernel userbin run clean rebuild tap-up disk disk-rebuild disk-clean
 
-all: build bootloader kernel
+all: build bootloader kernel userbin
 
 build:
-		mkdir -p build image/EFI/BOOT image/EFI/COREFORGE image/EFI/COREFORGE/KERNELS image/EFI/COREFORGE/ENTRIES
+		mkdir -p build image/EFI/BOOT image/EFI/COREFORGE image/EFI/COREFORGE/KERNELS image/EFI/COREFORGE/ENTRIES image/USERS
 
 bootloader: image/EFI/BOOT/BOOTX64.EFI
 
 kernel: image/EFI/COREFORGE/KERNELS/KERNEL.ELF
+
+userbin: image/USERS/HELLO.ELF image/USERS/FAULT.ELF
 
 $(OVMF_VARS_DST): | build
 		cp $(OVMF_VARS_SRC) $(OVMF_VARS_DST)
@@ -184,6 +206,12 @@ kernel/task.o: kernel/task.c kernel/task.h | build
 kernel/task_switch.o: kernel/task_switch.asm | build
 		$(NASM) $(NASMFLAGS) kernel/task_switch.asm -o $@
 
+kernel/user_enter.o: kernel/user_enter.asm | build
+		$(NASM) $(NASMFLAGS) kernel/user_enter.asm -o $@
+
+kernel/userproc.o: kernel/userproc.c kernel/userproc.h kernel/task.h kernel/vmm.h | build
+		$(CC) $(KERNEL_CFLAGS) -c kernel/userproc.c -o $@
+
 kernel/sched.o: kernel/sched.c kernel/sched.h kernel/task.h | build
 		$(CC) $(KERNEL_CFLAGS) -c kernel/sched.c -o $@
 
@@ -192,6 +220,12 @@ kernel/syscall.o: kernel/syscall.c kernel/syscall.h kernel/task.h | build
 
 kernel/acpi.o: kernel/acpi.c kernel/acpi.h | build
 		$(CC) $(KERNEL_CFLAGS) -c kernel/acpi.c -o $@
+
+kernel/serial.o: kernel/serial.c kernel/serial.h | build
+		$(CC) $(KERNEL_CFLAGS) -c kernel/serial.c -o $@
+
+kernel/rtc.o: kernel/rtc.c kernel/rtc.h | build
+		$(CC) $(KERNEL_CFLAGS) -c kernel/rtc.c -o $@
 
 kernel/tcc_wrap.o: kernel/tcc_wrap.c kernel/tcc/config.h kernel/tcc/libtcc.h | build
 		$(CC) $(KERNEL_CFLAGS) -Ikernel/tcc -c kernel/tcc_wrap.c -o $@
@@ -210,6 +244,20 @@ kernel/cfe.o: kernel/cfe.c kernel/cfe.h | build
 
 kernel/cfe_config.o: kernel/cfe_config.c kernel/cfe.h | build
 		$(CC) $(KERNEL_CFLAGS) -c kernel/cfe_config.c -o $@
+
+USERSPACE_OBJS    := \
+		user/crt0.o \
+		user/hello.o \
+		user/fault.o
+
+user/crt0.o: user/crt0.asm | build
+	$(NASM) $(NASMFLAGS) user/crt0.asm -o $@
+
+user/hello.o: user/hello.c user/common.h | build
+		$(CC) $(USERSPACE_CFLAGS) -c user/hello.c -o $@
+
+user/fault.o: user/fault.c user/common.h | build
+		$(CC) $(USERSPACE_CFLAGS) -c user/fault.c -o $@
 
 image/EFI/COREFORGE/KERNELS/KERNEL.ELF: $(KERNEL_OBJS)
 		$(LD_KERNEL) $(KERNEL_LDFLAGS) $(KERNEL_OBJS)
