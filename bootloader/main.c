@@ -39,6 +39,43 @@ static void print(EFI_SYSTEM_TABLE *st, CHAR16 *str) {
     st->ConOut->OutputString(st->ConOut, str);
 }
 
+/*
+ * Отладочные маркеры в QEMU debugcon (порт 0x402).
+ * Release-сборка OVMF ничего не печатает в debugcon сам, но порт жив,
+ * и наш трейл показывает, до какого этапа дошёл загрузчик. Всё, что
+ * после ExitBootServices, уже нельзя выводить через ConOut.
+ */
+#define BOOT_DEBUG_PORT 1
+
+#ifdef BOOT_DEBUG_PORT
+static void debug_write(const char *s) {
+    UINT16 port = 0x402;
+    while (*s) {
+        UINT8 ch = (UINT8)*s++;
+        __asm__ __volatile__("outb %[val], %[port]"
+                             :
+                             : [val] "a"(ch), [port] "d"(port));
+    }
+}
+
+static void debug_write_hex(UINT64 value) {
+    static const char hex[] = "0123456789ABCDEF";
+    char buf[19];
+    int i;
+
+    buf[0] = '0';
+    buf[1] = 'x';
+    for (i = 0; i < 16; i++) {
+        buf[2 + i] = hex[(value >> ((15 - i) * 4)) & 0xF];
+    }
+    buf[18] = '\0';
+    debug_write(buf);
+}
+#else
+#define debug_write(s) ((void)0)
+#define debug_write_hex(v) ((void)0)
+#endif
+
 __attribute__((noreturn))
 static void halt_forever(void) {
     for (;;) {
@@ -611,8 +648,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         return 1;
     }
 
+    debug_write("\r\n[L0] efi_main entered\r\n");
     SystemTable->ConOut->Reset(SystemTable->ConOut, 1);
     SystemTable->ConOut->ClearScreen(SystemTable->ConOut);
+    debug_write("[L1] console ready\r\n");
 
     print(SystemTable, L"CFOS bootloader\r\n");
     print(SystemTable, L"UEFI loader + boot.cfg + ELF kernel + jump to entry\r\n\r\n");
@@ -661,12 +700,19 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         print(SystemTable, L"Second GetMemoryMap failed.\r\n");
         halt_forever();
     }
+    debug_write("[L2] memory map ok\r\n");
 
     MEMORY_LAYOUT_PLAN plan;
     if (!build_memory_layout(memory_map, memory_map_size, descriptor_size, &plan)) {
         print(SystemTable, L"Failed to build memory layout.\r\n");
+        debug_write("[!] layout fail\r\n");
         halt_forever();
     }
+    debug_write("[L3] layout ok, kernel=0x");
+    debug_write_hex(plan.kernel_phys_base);
+    debug_write(" scratch=0x");
+    debug_write_hex(plan.scratch_phys);
+    debug_write("\r\n");
 
     print(SystemTable, L"Chosen usable region base: ");
     print_hex(SystemTable, plan.chosen_region_base);
@@ -720,11 +766,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     print_dec(SystemTable, bytes_to_sectors(plan.kernel_stack_top - plan.kernel_stack_bottom));
     print(SystemTable, L" sectors)\r\n\r\n");
 
+    /*
+     * Ядро резервируем как CODE: часть реальных прошивок маркирует
+     * EfiLoaderData как NX, и прыжок в ядро получит triple fault.
+     * OVMF/QEMU такое не делают, поэтому баг виден только на железе.
+     */
     status = reserve_region(
         SystemTable,
         plan.kernel_phys_base,
         plan.kernel_reserved_size,
-        EfiLoaderData
+        EfiLoaderCode
     );
     if (status != EFI_SUCCESS) {
         print(SystemTable, L"AllocatePages for kernel failed. Status=");
@@ -776,7 +827,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         SystemTable,
         plan.kernel_stack_bottom,
         plan.kernel_stack_top - plan.kernel_stack_bottom,
-        EfiLoaderData
+        EfiLoaderCode
     );
     if (status != EFI_SUCCESS) {
         print(SystemTable, L"AllocatePages for stack failed. Status=");
@@ -787,6 +838,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     CRASH_INFO *crash_info = (CRASH_INFO*)(UINTN)plan.crash_info_phys;
     show_previous_crash_screen(SystemTable, crash_info);
+    debug_write("[L4] reserves + crashscreen ok\r\n");
 
     BOOT_CONFIG config;
     UINTN selected = 0;
@@ -818,6 +870,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         print(SystemTable, selected_kernel_path);
         print(SystemTable, L"\r\n\r\n");
     }
+    debug_write("[L5] menu/config ok\r\n");
 
     ELF_LOAD_RESULT elf_result;
     memzero(&elf_result, sizeof(ELF_LOAD_RESULT));
@@ -860,6 +913,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
 
     print(SystemTable, L"Selected ELF kernel loaded successfully\r\n");
+    debug_write("[L6] ELF loaded\r\n");
     print(SystemTable, L"  Entry name:    ");
     print(SystemTable, selected_entry_name);
     print(SystemTable, L"\r\n");
@@ -1001,16 +1055,49 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 
     print(SystemTable, L"\r\nExiting UEFI Boot Services...\r\n");
 
-    status = SystemTable->BootServices->ExitBootServices(
-        ImageHandle,
-        final_map_key
-    );
+    debug_write("[L9] pre-EBS, watchdog off\r\n");
 
-    if (status != EFI_SUCCESS) {
-        /*
-         * Иногда карта памяти успевает измениться между GetMemoryMap и ExitBootServices.
-         * В этом случае обновляем её ещё раз и пробуем повторно.
-         */
+    /*
+     * Отключаем прошивочный 5-минутный watchdog — на медленных
+     * машинах он мог бы выстрелить в окне между EBS и прыжком.
+     */
+    SystemTable->BootServices->SetWatchdogTimer(0, 0, 0, 0);
+
+    /*
+     * На реальных прошивках карта памяти может меняться несколько раз
+     * (USB emulation и т.п.), и одного ретрая мало. Циклим до 10 попыток.
+     * Важно: после УСПЕШНОГО ExitBootServices нельзя вызывать никаких
+     * Boot Services, включая ConOut — поэтому все печати только в пути ошибок.
+     */
+    int ebs_ok = 0;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        debug_write("[EBS] attempt ");
+        debug_write_hex((UINT64)attempt);
+        debug_write("\r\n");
+
+        status = SystemTable->BootServices->ExitBootServices(
+            ImageHandle,
+            final_map_key
+        );
+
+        if (status == EFI_SUCCESS) {
+            ebs_ok = 1;
+            debug_write("[EBS] success\r\n");
+            break;
+        }
+
+        debug_write("[EBS] fail, status=0x");
+        debug_write_hex((UINT64)status);
+        debug_write("\r\n");
+
+        if (status != EFI_INVALID_PARAMETER) {
+            print(SystemTable, L"ExitBootServices failed! Status=");
+            print_hex(SystemTable, status);
+            print(SystemTable, L"\r\n");
+            halt_forever();
+        }
+
+        /* Карта изменилась: обновляем и пробуем снова. */
         final_map_size = (UINTN)plan.scratch_reserved_size;
         status = SystemTable->BootServices->GetMemoryMap(
             &final_map_size,
@@ -1029,17 +1116,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         boot_info->memory_map_size = final_map_size;
         boot_info->memory_descriptor_size = final_descriptor_size;
         boot_info->memory_descriptor_version = final_descriptor_version;
-
-        status = SystemTable->BootServices->ExitBootServices(
-            ImageHandle,
-            final_map_key
-        );
-
-        if (status != EFI_SUCCESS) {
-            print(SystemTable, L"ExitBootServices failed!\r\n");
-            halt_forever();
-        }
     }
+
+    if (!ebs_ok) {
+        print(SystemTable, L"ExitBootServices did not succeed after retries!\r\n");
+        halt_forever();
+    }
+
+    /* Прошивка оставит свой IDT/обработчики: приказываем всем молчать. */
+    __asm__ __volatile__("cli");
+    debug_write("[H] handing off to kernel\r\n");
 
     handoff_to_kernel(
         elf_result.entry_point,

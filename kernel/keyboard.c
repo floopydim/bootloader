@@ -108,24 +108,125 @@ uint8_t keyboard_get_modifiers(void) {
 
 /* --------------------------------------------------------------------------
  * Init / low-level
+ *
+ * На реальном железе контроллер 8042 нельзя полагаться только на прошивку:
+ * бит "enable kbd interrupt" (bit0) и трансляция сканкодов (bit6) могут
+ * быть выключены — тогда IRQ1 молчит и клавиатура не работает вообще.
+ * Делаем честную инициализацию и детекцию с таймаутами, чтобы система
+ * без PS/2 не зависала.
  * -------------------------------------------------------------------------- */
 
+#define PS2_CMD_ENABLE_KBD_PORT 0xAE
+#define PS2_CMD_DISABLE_KBD     0xAD
+#define PS2_CMD_DISABLE_MOUSE   0xA7
+#define PS2_CMD_READ_CONFIG     0x20
+#define PS2_CMD_WRITE_CONFIG    0x60
+#define PS2_CMD_SELF_TEST       0xAA
+#define PS2_SELF_TEST_OK        0x55
+
+#define STATUS_INPUT_FULL  0x02
+#define STATUS_TIMEOUT_SPINS 100000U
+
+static int g_keyboard_present = 0;
+
+static int ps2_wait_input_clear(uint32_t spins) {
+    while (spins--) {
+        if (!(inb(PS2_STATUS_PORT) & STATUS_INPUT_FULL)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ps2_wait_output(uint32_t spins) {
+    while (spins--) {
+        if (inb(PS2_STATUS_PORT) & STATUS_OUTPUT_FULL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void keyboard_init(void) {
+    uint8_t config;
+
     shift_pressed = 0;
     ctrl_pressed  = 0;
     alt_pressed   = 0;
     e0_prefix     = 0;
+    g_keyboard_present = 0;
     keyboard_buffer_clear();
-    while (keyboard_has_data()) (void)inb(PS2_DATA_PORT);
+
+    /* Слить накопленный вывод (будки прошивки и т.д.). */
+    while (keyboard_has_data()) {
+        (void)inb(PS2_DATA_PORT);
+    }
+
+    /* Контроллер? Команда чтения конфига должна дать ответ. */
+    outb(PS2_STATUS_PORT, PS2_CMD_READ_CONFIG);
+    if (!ps2_wait_output(STATUS_TIMEOUT_SPINS)) {
+        /* Нет 8042: ноутбук без PS/2. Не зависаем, просто фиксируем факт. */
+        return;
+    }
+    config = inb(PS2_DATA_PORT);
+
+    /* Отключаем порты на время реконфигурации. */
+    if (!ps2_wait_input_clear(STATUS_TIMEOUT_SPINS)) return;
+    outb(PS2_STATUS_PORT, PS2_CMD_DISABLE_KBD);
+    if (!ps2_wait_input_clear(STATUS_TIMEOUT_SPINS)) return;
+    outb(PS2_STATUS_PORT, PS2_CMD_DISABLE_MOUSE);
+
+    /* Самотест контроллера. */
+    if (!ps2_wait_input_clear(STATUS_TIMEOUT_SPINS)) return;
+    outb(PS2_STATUS_PORT, PS2_CMD_SELF_TEST);
+    if (!ps2_wait_output(STATUS_TIMEOUT_SPINS)) return;
+    if (inb(PS2_DATA_PORT) != PS2_SELF_TEST_OK) {
+        return;
+    }
+
+    /* Включаем прерывание клавиатуры (bit0) и трансляцию в Set 1 (bit6),
+       выключаем прерывание мыши (bit1). */
+    config |= (uint8_t)(1U << 0);   /* kbd interrupt enable */
+    config |= (uint8_t)(1U << 6);   /* translate */
+    config &= (uint8_t)~(1U << 1);  /* mouse interrupt disable */
+
+    if (!ps2_wait_input_clear(STATUS_TIMEOUT_SPINS)) return;
+    outb(PS2_STATUS_PORT, PS2_CMD_WRITE_CONFIG);
+    if (!ps2_wait_input_clear(STATUS_TIMEOUT_SPINS)) return;
+    outb(PS2_DATA_PORT, config);
+
+    /* Включаем клавиатурный порт. */
+    if (!ps2_wait_input_clear(STATUS_TIMEOUT_SPINS)) return;
+    outb(PS2_STATUS_PORT, PS2_CMD_ENABLE_KBD_PORT);
+
+    /* Слить мусор, который мог прилететь при включении. */
+    while (keyboard_has_data()) {
+        (void)inb(PS2_DATA_PORT);
+    }
+
+    g_keyboard_present = 1;
+}
+
+int keyboard_present(void) {
+    return g_keyboard_present;
 }
 
 int keyboard_has_data(void) {
     return (inb(PS2_STATUS_PORT) & STATUS_OUTPUT_FULL) != 0;
 }
 
+/* Bounded: раньше крутился вечно, если данные не приходят. */
 uint8_t keyboard_read_scancode(void) {
-    while (!keyboard_has_data()) __asm__ __volatile__("pause");
-    return inb(PS2_DATA_PORT);
+    uint32_t spins = STATUS_TIMEOUT_SPINS;
+
+    while (spins--) {
+        if (keyboard_has_data()) {
+            return inb(PS2_DATA_PORT);
+        }
+        __asm__ __volatile__("pause");
+    }
+
+    return 0;
 }
 
 /* --------------------------------------------------------------------------

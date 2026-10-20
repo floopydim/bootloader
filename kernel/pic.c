@@ -39,6 +39,33 @@ void pic_send_eoi(uint8_t irq) {
     outb(PIC1_COMMAND, PIC_EOI);
 }
 
+void pic_send_eoi_master_only(void) {
+    outb(PIC1_COMMAND, PIC_EOI);
+}
+
+/*
+ * Проверка спириозного прерывания (read ISR через OCW3).
+ * Спириозные IRQ7/IRQ15 на реальном 8259 — классика: без проверки
+ * EOI в слейв может "заложить" каскад и потерять IRQ8-15.
+ */
+int pic_irq_is_spurious(uint8_t irq) {
+    uint8_t isr;
+
+    if (irq < 8) {
+        outb(PIC1_COMMAND, 0x0B); /* OCW3: read ISR */
+        isr = inb(PIC1_COMMAND);
+        return (isr & (1u << irq)) == 0;
+    }
+
+    if (irq == 15) {
+        outb(PIC2_COMMAND, 0x0B); /* OCW3: read ISR */
+        isr = inb(PIC2_COMMAND);
+        return (isr & (1u << 7)) == 0;
+    }
+
+    return 0;
+}
+
 void pic_irq_mask(uint8_t irq) {
     uint16_t port;
     uint8_t value;

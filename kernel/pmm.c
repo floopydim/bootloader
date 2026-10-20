@@ -1,6 +1,14 @@
 #include "pmm.h"
+#include "panic.h"
 
 #define EFI_CONVENTIONAL_MEMORY 7
+
+/*
+ * Identity-маппинг ядра покрывает только 0..4 ГБ. Страницы выше этого
+ * лимита нельзя раздавать: обращение к ним через физический адрес
+ * поймает #PF. Ограничиваем PMM верхними 4 ГБ и с diagnose'ом.
+ */
+#define PMM_MAX_MANAGED_PAGES (1ULL << 20)  /* 4 GiB / 4 KiB */
 
 typedef struct {
     uint64_t base;
@@ -224,17 +232,28 @@ void pmm_init(CONSOLE *con, BOOT_INFO *boot_info) {
         uint64_t start_page = desc->physical_start / PMM_PAGE_SIZE;
         uint64_t end_page   = start_page + desc->number_of_pages;
 
+        /* Регионы целиком выше идент-мапа игнорируем. */
+        if (start_page >= PMM_MAX_MANAGED_PAGES) {
+            continue;
+        }
+
+        if (end_page > PMM_MAX_MANAGED_PAGES) {
+            end_page = PMM_MAX_MANAGED_PAGES;
+        }
+
         if (end_page > highest_page_plus_one) {
             highest_page_plus_one = end_page;
         }
     }
 
     if (highest_page_plus_one == 0) {
+        panic("PMM: no conventional memory below 4 GiB");
         return;
     }
 
     uint64_t required_bitmap_bytes = (highest_page_plus_one + 7) / 8;
     if (required_bitmap_bytes == 0) {
+        panic("PMM: computed bitmap size is zero");
         return;
     }
 
@@ -250,6 +269,11 @@ void pmm_init(CONSOLE *con, BOOT_INFO *boot_info) {
 
     uint64_t total_bitmap_bytes = required_bitmap_bytes * 2;
     if (bitmap_base + total_bitmap_bytes > scratch_end) {
+        /* Было: тихий return после которого PMM мёртв, а ядро шло дальше.
+           Теперь честная паника вместо неопределённого поведения. */
+        panicf("PMM: bitmap (%u bytes) exceeds scratch (%u bytes)",
+               (unsigned int)total_bitmap_bytes,
+               (unsigned int)boot_info->scratch_size);
         return;
     }
 
@@ -267,6 +291,11 @@ void pmm_init(CONSOLE *con, BOOT_INFO *boot_info) {
             (KERNEL_EFI_MEMORY_DESCRIPTOR*)(map_base + i * boot_info->memory_descriptor_size);
 
         if (desc->type != EFI_CONVENTIONAL_MEMORY || desc->number_of_pages == 0) {
+            continue;
+        }
+
+        /* Регионы выше лимита не управляем (совместно с первой фазой). */
+        if (desc->physical_start / PMM_PAGE_SIZE >= PMM_MAX_MANAGED_PAGES) {
             continue;
         }
 
@@ -302,6 +331,12 @@ void pmm_init(CONSOLE *con, BOOT_INFO *boot_info) {
         {
             boot_info->crash_info_phys,
             boot_info->crash_info_phys + boot_info->crash_info_size
+        },
+        {
+            /* initrd грузится загрузчиком и обязан пережить pmm_alloc.
+               Без этого PMM раздавал бы его страницы под новые данные. */
+            boot_info->initrd_phys,
+            boot_info->initrd_phys + boot_info->initrd_size
         }
     };
 

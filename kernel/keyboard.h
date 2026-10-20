@@ -35,6 +35,7 @@ typedef enum {
 void keyboard_init(void);
 
 /* low-level helpers */
+int keyboard_present(void);
 int keyboard_has_data(void);
 uint8_t keyboard_read_scancode(void);
 char keyboard_scancode_to_ascii(uint8_t scancode);

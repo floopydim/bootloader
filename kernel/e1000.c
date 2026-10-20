@@ -1,6 +1,7 @@
 #include "e1000.h"
 #include "pci.h"
 #include "kheap.h"
+#include "vmm.h"
 #include <stdint.h>
 
 #define E1000_VENDOR_INTEL 0x8086
@@ -455,6 +456,18 @@ int e1000_init(E1000_INFO *info) {
 
     if (info->mmio_base == 0) {
         return 0;
+    }
+
+    /*
+     * MMIO NIC через identity-маппинг идёт как обычная WB-память:
+     * на реальном контроллере это stale reads и зависания.
+     * Мапим диапазон с PCD (cache disable), как у AHCI.
+     */
+    {
+        uint64_t map_base = info->mmio_base & ~(uint64_t)0xFFFFFULL;
+        uint64_t map_size = 0x20000U;
+        vmm_map_range(map_base, map_base, map_size,
+                      VMM_PRESENT | VMM_WRITE | VMM_PCD);
     }
 
     command = pci_config_read16(info->bus, info->device, info->function, 0x04);

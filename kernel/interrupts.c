@@ -63,8 +63,32 @@ uint32_t timer_hz(void) {
     return pit_hz();
 }
 
+/*
+ * Локальный APIC на современных прошивках может остаться включённым
+ * после UEFI/SMM — тогда часть прерываний уходит в него, а legacy PIC
+ * их никогда не увидит (эффект: "клавиатура молчит"). Отключаем.
+ * В x2APIC-режиме не трогаем: возврат из x2APIC — отдельная процедура.
+ */
+static void lapic_disable_if_enabled(void) {
+    uint32_t lo, hi;
+
+    __asm__ __volatile__("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x1B));
+
+    if (lo & (1U << 10)) {
+        return; /* x2APIC mode — не лезем */
+    }
+
+    if (lo & (1U << 11)) {
+        lo &= ~(1U << 11);
+        __asm__ __volatile__("wrmsr" : : "a"(lo), "d"(hi), "c"(0x1B));
+    }
+}
+
 void interrupts_init(void) {
     int i;
+
+    interrupts_disable();
+    lapic_disable_if_enabled();
 
     idt_init();
 
@@ -103,13 +127,26 @@ void interrupt_dispatch(INTERRUPT_FRAME *frame) {
 
     if (vec >= 32 && vec < 48) {
         uint8_t irq = (uint8_t)(vec - 32);
+        int spurious = pic_irq_is_spurious(irq);
 
-        if (irq == 0) {
-            pit_handle_irq();
+        if (!spurious) {
+            if (irq == 0) {
+                pit_handle_irq();
+            }
+
+            if (irq_handlers[irq]) {
+                irq_handlers[irq]();
+            }
         }
 
-        if (irq_handlers[irq]) {
-            irq_handlers[irq]();
+        if (irq == 15 && spurious) {
+            /*
+             * Спириозный IRQ15: слейв EOI слать нельзя (иначе каскад
+             * "залипает" и теряются IRQ8-15), а мастеру послать нужно —
+             * у него всё ещё в ин-сервисе каскадная линия IRQ2.
+             */
+            pic_send_eoi_master_only();
+            return;
         }
 
         pic_send_eoi(irq);

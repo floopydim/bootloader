@@ -13,6 +13,11 @@
 #define AHCI_SUBCLASS_SATA      0x06
 #define AHCI_PROGIF_AHCI        0x01
 
+/* Таймаут ожидания завершения команды BCI. Сотни миллионов спинов —
+   порядок сотен миллисекунд; QEMU проходит за мгновение, реальный
+   зависший контроллер теперь не убивает ядро. */
+#define AHCI_CMD_COMPLETION_SPINS 200000000U
+
 #define PCI_COMMAND_IO          (1U << 0)
 #define PCI_COMMAND_MEMORY      (1U << 1)
 #define PCI_COMMAND_BUSMASTER   (1U << 2)
@@ -321,7 +326,9 @@ static void ahci_port_stop(HBA_PORT *port) {
 }
 
 static void ahci_port_start(HBA_PORT *port) {
-    while (port->cmd & AHCI_PORT_CMD_CR) {
+    /* CR (command running) обязан уйти сам; вечное ожидание опасно. */
+    if (!ahci_wait_clear(&port->cmd, AHCI_PORT_CMD_CR, 1000000)) {
+        return;
     }
 
     port->cmd |= AHCI_PORT_CMD_FRE;
@@ -497,12 +504,21 @@ static int ahci_issue_identify(uint32_t port_no, uint16_t *identify_words) {
     port->is = 0xFFFFFFFFU;
     port->ci = (1U << slot);
 
-    while (1) {
-        if ((port->ci & (1U << slot)) == 0) {
-            break;
+    /* Bounded timeout: реальные контроллеры могут зависнуть (port wedged,
+       ошибка FIS) — вечный цикл подвешивал бы намертво всё ядро. */
+    {
+        uint32_t spins = AHCI_CMD_COMPLETION_SPINS;
+        while (spins--) {
+            if ((port->ci & (1U << slot)) == 0) {
+                break;
+            }
+
+            if (port->is & (1U << 30)) {
+                return 0;
+            }
         }
 
-        if (port->is & (1U << 30)) {
+        if (spins == 0) {
             return 0;
         }
     }
@@ -867,12 +883,20 @@ static int ahci_rw(uint32_t port_no,
     port->is = 0xFFFFFFFFU;
     port->ci = (1U << slot);
 
-    while (1) {
-        if ((port->ci & (1U << slot)) == 0) {
-            break;
+    /* Bounded timeout: без него зависший порт зависает ядро навсегда. */
+    {
+        uint32_t spins = AHCI_CMD_COMPLETION_SPINS;
+        while (spins--) {
+            if ((port->ci & (1U << slot)) == 0) {
+                break;
+            }
+
+            if (port->is & (1U << 30)) {
+                return 0;
+            }
         }
 
-        if (port->is & (1U << 30)) {
+        if (spins == 0) {
             return 0;
         }
     }

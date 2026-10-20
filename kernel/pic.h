@@ -5,6 +5,8 @@
 
 void pic_remap_all_masked(void);
 void pic_send_eoi(uint8_t irq);
+void pic_send_eoi_master_only(void);
+int  pic_irq_is_spurious(uint8_t irq);
 
 void pic_irq_mask(uint8_t irq);
 void pic_irq_unmask(uint8_t irq);

@@ -297,6 +297,13 @@ static void kernel_init_input(CONSOLE *con) {
 
     keyboard_init();
 
+    if (!keyboard_present()) {
+        console_printf(con, "      WARNING: PS/2 controller not found.\n");
+        console_printf(con, "      Keyboard will be unavailable.\n");
+        console_printf(con, "      (Enable USB legacy in firmware for PS/2 emulation.)\n\n");
+        return;
+    }
+
     irq_register_handler(1, keyboard_irq_handler);
     irq_unmask(1);
 
@@ -413,7 +420,7 @@ static void kernel_prepare_timer(CONSOLE *con) {
 }
 
 
-#define KERNEL_DEBUG_SHELL_WAIT_SPINS  80000000U
+#define KERNEL_DEBUG_SHELL_WAIT_SPINS 600000000U
 #define KERNEL_F5_SCANCODE_SET1        0x3FU
 
 static int kernel_poll_debug_shell_hotkey(void) {

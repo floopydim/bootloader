@@ -266,7 +266,8 @@ typedef struct {
 
     VOID *GetNextMonotonicCount;
     VOID *Stall;
-    VOID *SetWatchdogTimer;
+
+    EFI_STATUS EFIAPI (*SetWatchdogTimer)(UINTN timeout, UINT64 watchdog_code, UINTN data_size, CHAR16 *watchdog_data);
 
     VOID *ConnectController;
     VOID *DisconnectController;
