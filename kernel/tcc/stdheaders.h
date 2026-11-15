@@ -39,6 +39,9 @@ typedef struct {
     int _fd;
     int _eof;
     int _err;
+    void *_base;          /* RAM-file layer (cc3): buffer */
+    unsigned long _len;   /* RAM-file layer: bytes in buffer */
+    unsigned long _pos;   /* RAM-file layer: read/write cursor */
 } FILE;
 
 #define stdin  ((FILE*)0)
@@ -52,7 +55,7 @@ typedef struct {
 /* Stub implementations live in tcc_libc.c */
 extern FILE *tcc_fopen(const char *path, const char *mode);
 extern size_t tcc_fread(void *ptr, size_t size, size_t nmemb, FILE *stream);
-extern int    tcc_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
+extern size_t tcc_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream);
 extern FILE  *tcc_freopen(const char *path, const char *mode, FILE *stream);
 extern int    tcc_fflush(FILE *stream);
 extern int    tcc_fclose(FILE *stream);
@@ -342,6 +345,9 @@ extern time_t time(time_t *t);
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
 extern ssize_t read(int fd, void *buf, size_t count);
+extern int     close(int fd);
+extern int     execvp(const char *file, char *const argv[]);
+extern void    _exit(int status);
 
 /* --------------------------------------------------------------------------
  * stdio.h additional stubs

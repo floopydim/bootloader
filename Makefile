@@ -28,6 +28,13 @@ image/USERS/FAULT.ELF: user/crt0.o user/fault.o user/user_linker.ld | build
 
 OVMF_CODE       := /usr/share/edk2/x64/OVMF_CODE.4m.fd
 OVMF_VARS_SRC   := /usr/share/edk2/x64/OVMF_VARS.4m.fd
+
+# Ring 3 runtime object for the in-kernel TCC (cc3)
+build/ccrt.o: user/tcc3rt.asm | build
+		$(NASM) $(NASMFLAGS) user/tcc3rt.asm -o $@
+
+kernel/cc3_rtobj.h: build/ccrt.o scripts/embedrt.py
+		python3 scripts/embedrt.py build/ccrt.o kernel/cc3_rtobj.h
 OVMF_VARS_DST   := build/OVMF_VARS.4m.fd
 
 BOOT_OBJS := \
@@ -77,6 +84,7 @@ KERNEL_OBJS := \
 		kernel/user_enter.o \
 		kernel/tcc_wrap.o \
 		kernel/tcc_shell.o \
+		kernel/tcc3.o \
 		kernel/tcc/tcc.o \
 		kernel/tcc/tcc_libc.o \
 		kernel/cfe.o \
@@ -93,7 +101,12 @@ bootloader: image/EFI/BOOT/BOOTX64.EFI
 
 kernel: image/EFI/COREFORGE/KERNELS/KERNEL.ELF
 
-userbin: image/USERS/HELLO.ELF image/USERS/FAULT.ELF
+userbin: image/USERS/HELLO.ELF image/USERS/FAULT.ELF image/USERS/HELLO3.C
+
+# cc3 demo source: shipped into the FAT image so `cc3 sd0p1 hello3.c`
+# works out of the box (compiled *inside* CFOS at runtime)
+image/USERS/HELLO3.C: user/hello3.c | build
+		cp user/hello3.c $@
 
 $(OVMF_VARS_DST): | build
 		cp $(OVMF_VARS_SRC) $(OVMF_VARS_DST)
@@ -232,6 +245,9 @@ kernel/tcc_wrap.o: kernel/tcc_wrap.c kernel/tcc/config.h kernel/tcc/libtcc.h | b
 
 kernel/tcc_shell.o: kernel/tcc_shell.c kernel/shell.h | build
 		$(CC) $(KERNEL_CFLAGS) -Ikernel/tcc -c kernel/tcc_shell.c -o $@
+
+kernel/tcc3.o: kernel/tcc3.c kernel/cc3_rtobj.h kernel/tcc/config.h kernel/tcc/libtcc.h kernel/tcc/tcc.h kernel/tcc/stdheaders.h | build
+		$(CC) $(KERNEL_CFLAGS) -Ikernel/tcc -c kernel/tcc3.c -o $@
 
 kernel/tcc/tcc.o: kernel/tcc/tcc.c kernel/tcc/tcc.h kernel/tcc/libtcc.h kernel/tcc/config.h kernel/tcc/tccdefs_.h | build
 		$(CC) $(KERNEL_CFLAGS) -Ikernel/tcc -fcommon -w -DTCC_VERSION=\"0.9.27\" -c kernel/tcc/tcc.c -o $@

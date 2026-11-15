@@ -4,6 +4,15 @@
 #include "../kheap.h"
 #include "../panic.h"
 
+/* cc3 RAM-file layer (implemented in kernel/tcc3.c) */
+extern int    cc_ram_open(const char *path);
+extern int    cc_ram_close(int fd);
+extern ssize_t cc_ram_read(int fd, void *buf, size_t count);
+extern ssize_t cc_ram_lseek(int fd, long off, int whence);
+extern int    cc_out_is(void *stream);
+extern FILE  *cc_out_fdopen(int fd, const char *mode);
+extern int    cc_out_write(const void *buf, size_t bytes);
+
 /* --------------------------------------------------------------------------
  * Global console pointer -- set by tcc_wrap.c during init
  * -------------------------------------------------------------------------- */
@@ -412,7 +421,11 @@ int tcc_vfprintf(FILE *stream, const char *fmt, va_list ap) {
 }
 
 int tcc_fputc(int c, FILE *stream) {
-    (void)stream;
+    if (cc_out_is(stream)) {
+        unsigned char b = (unsigned char)c;
+        cc_out_write(&b, 1);
+        return c;
+    }
     if (g_tcc_con) console_putchar(g_tcc_con, (char)c);
     return c;
 }
@@ -438,10 +451,20 @@ int tcc_puts(const char *s) {
  * File I/O stubs -- Phase 1: not supported
  * -------------------------------------------------------------------------- */
 
+/* RAM-file identification lives in cc3 (kernel/tcc3.c). */
 FILE *tcc_fopen(const char *path, const char *mode) { (void)path; (void)mode; tcc_errno = ENOENT; return NULL; }
 FILE *tcc_freopen(const char *path, const char *mode, FILE *stream) { (void)path; (void)mode; (void)stream; tcc_errno = ENOENT; return NULL; }
 size_t tcc_fread(void *ptr, size_t size, size_t nmemb, FILE *stream) { (void)ptr; (void)size; (void)nmemb; (void)stream; return 0; }
-int tcc_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) { (void)ptr; (void)size; (void)nmemb; (void)stream; return 0; }
+
+size_t tcc_fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
+    if (cc_out_is(stream)) {
+        size_t bytes = size * nmemb;
+        if (bytes && cc_out_write(ptr, bytes) < 0) return 0;
+        return nmemb;
+    }
+    return 0;
+}
+
 int tcc_fclose(FILE *stream) { (void)stream; return 0; }
 int tcc_fseek(FILE *stream, long offset, int whence) { (void)stream; (void)offset; (void)whence; return -1; }
 long tcc_ftell(FILE *stream) { (void)stream; return -1; }
@@ -561,9 +584,21 @@ int tcc_sscanf(const char *str, const char *fmt, ...) {
  * Additional stubs for TCC compilation
  * -------------------------------------------------------------------------- */
 
-ssize_t read(int fd, void *buf, size_t count) { (void)fd; (void)buf; (void)count; return -1; }
+ssize_t read(int fd, void *buf, size_t count) {
+    /* TCC's ELF/object loaders read via the raw fd layer */
+    if (fd == 128) return cc_ram_read(fd, buf, count);   /* RAM_FD_RT */
+    return -1;
+}
+
+/* tccrun.c asks for the page size; the kernel path never runs it. */
+long sysconf(int name) {
+    if (name == 30) return 4096;   /* _SC_PAGESIZE */
+    return -1;
+}
 int tcc_fflush(FILE *stream) { (void)stream; return 0; }
-long stub_lseek(int fd, long offset, int whence) { (void)fd; (void)offset; (void)whence; return -1; }
+long stub_lseek(int fd, long offset, int whence) {
+    return (long)cc_ram_lseek(fd, offset, whence);
+}
 long double ldexpl(long double x, int exp) { (void)exp; return x; }
 
 struct tm *localtime(const time_t *t) {
@@ -645,11 +680,22 @@ unsigned long long tcc_strtoull(const char *nptr, char **endptr, int base) {
  * POSIX stubs
  * -------------------------------------------------------------------------- */
 
-int stub_open(const char *pathname, int flags, ...) { (void)pathname; (void)flags; tcc_errno = ENOENT; return -1; }
+int stub_open(const char *pathname, int flags, ...) {
+    (void)flags;
+    int fd = (int)cc_ram_open(pathname);
+    if (fd >= 0) return fd;
+    tcc_errno = ENOENT;
+    return -1;
+}
 int stub_unlink(const char *pathname) { (void)pathname; tcc_errno = ENOENT; return -1; }
 char *stub_getcwd(char *buf, size_t size) { (void)buf; (void)size; return NULL; }
 char *stub_strerror(int errnum) { (void)errnum; return "Unknown error"; }
-FILE *stub_fdopen(int fd, const char *mode) { (void)fd; (void)mode; tcc_errno = ENOENT; return NULL; }
+FILE *stub_fdopen(int fd, const char *mode) {
+    FILE *f = cc_out_fdopen(fd, mode);
+    if (f) return f;
+    tcc_errno = ENOENT;
+    return NULL;
+}
 
 /* --------------------------------------------------------------------------
  * Standard-name wrappers — libtcc.c #undef's the macros so we need
@@ -711,7 +757,7 @@ char **g_environ = NULL;
  * Additional POSIX stubs — TCC references these in various code paths
  * -------------------------------------------------------------------------- */
 
-int close(int fd) { (void)fd; return -1; }
+int close(int fd) { return cc_ram_close(fd); }
 int execvp(const char *file, char *const argv[]) { (void)file; (void)argv; return -1; }
 int mprotect(void *addr, size_t len, int prot) { (void)addr; (void)len; (void)prot; return 0; }
 

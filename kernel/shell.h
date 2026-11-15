@@ -24,5 +24,7 @@ void shell_handle_char(SHELL *sh, char ch);
 
 /* TCC shell commands */
 void shell_tcc_dispatch(SHELL *sh);
+void shell_run_cc3(SHELL *sh, const char *args);
+void shell_resolve_cwd_path(const char *input, char *out, uint32_t out_size);
 
 #endif

@@ -3,6 +3,7 @@
 #include "fat32.h"
 #include "kheap.h"
 #include "partition.h"
+#include <stdint.h>
 
 /* External functions from tcc_wrap.c */
 extern int tcc_kernel_compile(const char *source, void **out_entry);
@@ -130,4 +131,141 @@ void shell_tcc_dispatch(SHELL *sh) {
         console_printf(sh->con, "  Example: cc sd0p1 hello.c\n");
         return;
     }
+}
+
+/* --------------------------------------------------------------------------
+ * cc3 — compile a ring 3 userspace ELF with the in-kernel TCC
+ *
+ * Reads <file.c> from a FAT32 partition, compiles it into a full ELF64
+ * executable linked at USER_BASE (ring 3 image, loadable by `run`), and
+ * writes it next to the source as <stem>.elf.
+ *
+ * Usage: cc3 <partition> <file.c>
+ *   Example: cc3 sd0p1 hello3.c        -> /users/hello3.elf (run hello3.elf)
+ * -------------------------------------------------------------------------- */
+
+extern int tcc_kernel_compile_elf(CONSOLE *con, const char *source,
+                                  uint8_t **out_img, uint32_t *out_size);
+
+static void cc3_build_outname(const char *src, char *out, uint32_t cap) {
+    /* strip leading spaces */
+    while (*src == ' ') src++;
+
+    /* copy directory part if any */
+    const char *last_slash = NULL;
+    for (const char *p = src; *p; p++) {
+        if (*p == '/') last_slash = p;
+    }
+
+    uint32_t n = 0;
+    if (last_slash) {
+        const char *p = src;
+        while (p <= last_slash && n + 1 < cap) out[n++] = *p++;
+    }
+
+    /* stem without extension, after the slash */
+    const char *s = last_slash ? last_slash + 1 : src;
+    const char *dot = NULL;
+    {
+        const char *q = s;
+        while (*q) { if (*q == '.') dot = q; q++; }
+    }
+
+    while (*s && (dot ? s < dot : 1) && n + 1 < cap) out[n++] = *s++;
+
+    const char *ext = ".elf";
+    while (*ext && n + 1 < cap) out[n++] = *ext++;
+    out[n] = '\0';
+}
+
+void shell_run_cc3(SHELL *sh, const char *args) {
+    char part_name[32];
+    char file_path[128];
+    char out_path[160];
+    uint32_t i = 0;
+    uint32_t j = 0;
+
+    while (args[i] == ' ') i++;
+    while (args[i] && args[i] != ' ' && j + 1 < sizeof(part_name))
+        part_name[j++] = args[i++];
+    part_name[j] = '\0';
+
+    if (!part_name[0]) {
+        console_printf(sh->con, "Usage: cc3 <partition> <file.c>\n");
+        console_printf(sh->con, "  Ring 3 compiler: file.c -> file.elf, then run file.elf\n");
+        console_printf(sh->con, "  Example: cc3 sd0p1 hello3.c\n");
+        return;
+    }
+
+    while (args[i] == ' ') i++;
+    j = 0;
+    while (args[i] && args[i] != ' ' && j + 1 < sizeof(file_path))
+        file_path[j++] = args[i++];
+    file_path[j] = '\0';
+
+    if (!file_path[0]) {
+        console_printf(sh->con, "Usage: cc3 <partition> <file.c>\n");
+        return;
+    }
+
+    /* resolve relative paths against the shell cwd */
+    char resolved_path[160];
+    shell_resolve_cwd_path(file_path, resolved_path, sizeof(resolved_path));
+
+    PARTITION_INFO *part = cc_find_partition(sh, part_name);
+    if (!part) return;
+
+    uint8_t *src_buf = NULL;
+    uint32_t src_size = 0;
+
+    if (!fat32_read_file(part, resolved_path, &src_buf, &src_size)) {
+        console_printf(sh->con, "cc3: cannot read '%s' on %s\n", resolved_path, part->name);
+        return;
+    }
+
+    if (src_size == 0) {
+        console_printf(sh->con, "cc3: '%s' is empty\n", resolved_path);
+        kfree(src_buf);
+        return;
+    }
+
+    char *source = kmalloc(src_size + 1);
+    if (!source) {
+        console_printf(sh->con, "cc3: out of memory\n");
+        kfree(src_buf);
+        return;
+    }
+    for (uint32_t k = 0; k < src_size; k++) source[k] = (char)src_buf[k];
+    source[src_size] = '\0';
+    kfree(src_buf);
+
+    console_printf(sh->con, "cc3: compiling '%s' (%u bytes) for ring 3...\n",
+                   resolved_path, src_size);
+
+    uint8_t *img = NULL;
+    uint32_t img_size = 0;
+
+    if (tcc_kernel_compile_elf(sh->con, source, &img, &img_size) != 0) {
+        console_printf(sh->con, "cc3: compilation failed\n");
+        kfree(source);
+        return;
+    }
+
+    kfree(source);
+    console_printf(sh->con, "cc3: image ready (%u bytes)\n", img_size);
+
+    cc3_build_outname(resolved_path, out_path, sizeof(out_path));
+
+    /* create the target if brand new (write_file overwrites existing) */
+    fat32_create_file(sh->con, part, out_path);
+
+    if (!fat32_write_file(sh->con, part, out_path, img, img_size)) {
+        console_printf(sh->con, "cc3: cannot write '%s' on %s\n", out_path, part->name);
+        kfree(img);
+        return;
+    }
+    kfree(img);
+
+    console_printf(sh->con, "cc3: wrote '%s' — run it with: run %s\n",
+                   out_path, out_path);
 }

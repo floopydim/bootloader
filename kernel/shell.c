@@ -406,6 +406,8 @@ static void shell_print_help(SHELL *sh) {
     console_printf(sh->con, "  cfe <part> <file> [-kbp-vim] - CFOS text editor\n");
     console_printf(sh->con, "TCC Compiler:\n");
     console_printf(sh->con, "  cc <part> <file.c> - compile & run C source from FAT32\n");
+    console_printf(sh->con, "  cc3 <part> <file.c> - ring 3 compiler: file.c -> file.elf,"
+                              " then `run file.elf`\n");
     console_printf(sh->con, "History:  Arrow Up / Arrow Down for command history\n");
 }
 
@@ -1634,6 +1636,12 @@ static void shell_resolve_path(const char *input, char *out, uint32_t out_size) 
     out[i] = '\0';
 }
 
+/* Public wrapper for cc3/other commands: resolve a relative path
+ * against the shell cwd. */
+void shell_resolve_cwd_path(const char *input, char *out, uint32_t out_size) {
+    shell_resolve_path(input, out, out_size);
+}
+
 static PARTITION_INFO *shell_resolve_part(SHELL *sh, const char *name) {
     if (!name || !name[0]) {
         if (g_cwd_part) return g_cwd_part;
@@ -2559,6 +2567,14 @@ static void shell_execute(SHELL *sh) {
     }
 
     /* TCC commands */
+    if (str_starts_with(sh->input, "cc3 ")) {
+        shell_run_cc3(sh, sh->input + 4);
+        return;
+    }
+    if (str_eq(sh->input, "cc3")) {
+        shell_run_cc3(sh, "");
+        return;
+    }
     if (str_starts_with(sh->input, "cc ") || str_eq(sh->input, "cc")) {
         shell_tcc_dispatch(sh);
         return;
